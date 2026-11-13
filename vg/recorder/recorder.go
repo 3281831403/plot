@@ -101,8 +101,30 @@ func (c *Canvas) ReplayOn(dst vg.Canvas) error {
 		}
 		fa.fonts = c.fonts
 	}
+	// restores pairs recorded Clip/PopClip actions when the
+	// destination supports clipping.
+	var restores []func()
 	for _, a := range c.Actions {
-		a.ApplyTo(dst)
+		switch a := a.(type) {
+		case *Clip:
+			if cl, ok := dst.(vg.ClipCanvas); ok {
+				restores = append(restores, cl.Clip(a.Rectangle))
+			} else {
+				restores = append(restores, func() {})
+			}
+		case *PopClip:
+			if n := len(restores); n > 0 {
+				restores[n-1]()
+				restores = restores[:n-1]
+			} else {
+				return fmt.Errorf("recorder: PopClip without a matching Clip")
+			}
+		default:
+			a.ApplyTo(dst)
+		}
+	}
+	if len(restores) != 0 {
+		return fmt.Errorf("recorder: %d Clip actions without a matching PopClip", len(restores))
 	}
 	return nil
 }
@@ -452,6 +474,60 @@ type Commenter interface {
 }
 
 var _ Commenter = (*Canvas)(nil)
+
+// Clip corresponds to the vg.ClipCanvas.Clip method. It records a
+// rectangular clipping region together with the PopClip that ends it.
+type Clip struct {
+	Rectangle vg.Rectangle
+
+	l callerLocation
+}
+
+// Clip implements the vg.ClipCanvas interface.
+func (c *Canvas) Clip(r vg.Rectangle) (restore func()) {
+	c.append(&Clip{Rectangle: r})
+	return func() {
+		c.PopClip()
+	}
+}
+
+// Call returns the method call that generated the action.
+func (a *Clip) Call() string {
+	return fmt.Sprintf("%sClip(%#v)", a.l, a.Rectangle)
+}
+
+// ApplyTo is a no-op: ReplayOn handles Clip together with its matching
+// PopClip so that the restore function can be invoked.
+func (a *Clip) ApplyTo(c vg.Canvas) {}
+
+func (a *Clip) callerLocation() *callerLocation {
+	return &a.l
+}
+
+// PopClip ends the clipping region opened by the most recent Clip.
+type PopClip struct {
+	l callerLocation
+}
+
+// PopClip records the end of a clipping region.
+func (c *Canvas) PopClip() {
+	c.append(&PopClip{})
+}
+
+// Call returns the method call that generated the action.
+func (a *PopClip) Call() string {
+	return fmt.Sprintf("%sPopClip()", a.l)
+}
+
+// ApplyTo is a no-op: ReplayOn handles PopClip together with its
+// matching Clip.
+func (a *PopClip) ApplyTo(c vg.Canvas) {}
+
+func (a *PopClip) callerLocation() *callerLocation {
+	return &a.l
+}
+
+var _ vg.ClipCanvas = (*Canvas)(nil)
 
 // Comment implements a comment mechanism.
 type Comment struct {

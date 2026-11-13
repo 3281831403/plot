@@ -58,8 +58,11 @@
 <path d="M41.33,103.52L45.33,103.52" style="fill:none;stroke:#000000;stroke-width:0.5" />
 <path d="M41.33,110.6L45.33,110.6" style="fill:none;stroke:#000000;stroke-width:0.5" />
 <path d="M45.33,46.88L45.33,117.68" style="fill:none;stroke:#000000;stroke-width:0.5" />
+<defs><clipPath id="gonum-clip-0"><rect x="53.796" y="46.88" width="81.291" height="70.797"/></clipPath></defs>
+<g clip-path="url(#gonum-clip-0)">
 <path d="M137.59,117.68A2.5,2.5 0 1 1 132.59,117.68A2.5,2.5 0 1 1 137.59,117.68Z" style="fill:none;stroke:#000000;stroke-width:0.5" />
 <path d="M56.296,117.68A2.5,2.5 0 1 1 51.296,117.68A2.5,2.5 0 1 1 56.296,117.68Z" style="fill:none;stroke:#000000;stroke-width:0.5" />
 <path d="M56.296,46.88A2.5,2.5 0 1 1 51.296,46.88A2.5,2.5 0 1 1 56.296,46.88Z" style="fill:none;stroke:#000000;stroke-width:0.5" />
+</g>
 </g>
 </svg>

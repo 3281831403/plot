@@ -147,6 +147,25 @@ func (e *Canvas) Pop() {
 	e.buf.WriteString("grestore\n")
 }
 
+// Clip restricts drawing to the intersection of the given rectangle
+// with the current clipping region. The rectangle is expressed in the
+// canvas's current user coordinate system. The returned function
+// restores the clipping region that was in place when Clip was called.
+func (e *Canvas) Clip(r vg.Rectangle) (restore func()) {
+	e.buf.WriteString("gsave\n")
+	fmt.Fprintf(e.buf, "newpath %.*g %.*g %.*g %.*g rectpath clip\n",
+		pr, r.Min.X.Dots(DPI),
+		pr, r.Min.Y.Dots(DPI),
+		pr, r.Size().X.Dots(DPI),
+		pr, r.Size().Y.Dots(DPI),
+	)
+	return func() {
+		e.buf.WriteString("grestore\n")
+	}
+}
+
+var _ vg.ClipCanvas = (*Canvas)(nil)
+
 func (e *Canvas) Stroke(path vg.Path) {
 	if e.context().width <= 0 {
 		return

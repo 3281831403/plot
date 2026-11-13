@@ -169,9 +169,15 @@ func (p *Plot) Draw(c draw.Canvas) {
 	y.draw(padY(p, draw.Crop(c, 0, 0, xheight, 0)))
 
 	dataC := padY(p, padX(p, draw.Crop(c, ywidth, 0, xheight, 0)))
+	// Plotters draw into the data rectangle: any ink past its
+	// edges (glyph halves, stroke caps, ...) must be cut off there.
+	// The axes, title and legend are drawn outside this clipped
+	// region and so remain fully visible.
+	restore := dataC.Clip()
 	for _, data := range p.plotters {
 		data.Plot(dataC, p)
 	}
+	restore()
 
 	p.Legend.Draw(draw.Crop(c, ywidth, 0, xheight, 0))
 }

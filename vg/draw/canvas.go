@@ -289,6 +289,38 @@ func New(c vg.CanvasSizer) Canvas {
 	return NewCanvas(c, w, h)
 }
 
+// Clip restricts drawing on the underlying vg.Canvas to the Canvas's
+// Rectangle and returns a function that removes the restriction.
+//
+// Anything drawn after Clip is cut off at the rectangle edges: this
+// covers glyph ink, stroke widths and text, not just the path anchor
+// points. Axis labels, titles and legends drawn outside the rectangle
+// are unaffected because they are drawn on a different, unclipped
+// canvas. The returned function must be called once drawing inside the
+// rectangle is finished; after it returns the underlying canvas is
+// fully usable again, with no clipping region left behind.
+//
+// Subcanvases produced by Crop, Tiles or the plot padding helpers nest
+// draw.Canvas values inside each other, so Clip unwraps them to reach
+// the actual backend. If that backend does not implement vg.ClipCanvas,
+// Clip still returns a restore function but no clipping is applied.
+func (c *Canvas) Clip() (restore func()) {
+	backend := vg.Canvas(c.Canvas)
+	for {
+		switch inner := backend.(type) {
+		case *Canvas:
+			backend = inner.Canvas
+		case Canvas:
+			backend = inner.Canvas
+		default:
+			if cl, ok := backend.(vg.ClipCanvas); ok {
+				return cl.Clip(c.Rectangle)
+			}
+			return func() {}
+		}
+	}
+}
+
 // NewFormattedCanvas creates a new vg.CanvasWriterTo with the specified
 // image format. Supported formats need to be registered by importing one or
 // more of the following packages:

@@ -90,6 +90,23 @@ type CanvasSizer interface {
 	Size() (x, y Length)
 }
 
+// ClipCanvas is a Canvas that supports rectangular clipping of the
+// ink it receives. A Canvas does not have to implement ClipCanvas:
+// vg.Canvas is intentionally kept free of clipping so that backends
+// with no clipping primitive can implement the interface unchanged.
+// On backends that do implement it, draw.Canvas.Clip uses it to cut
+// off anything drawn outside the requested rectangle.
+type ClipCanvas interface {
+	Canvas
+
+	// Clip restricts drawing to the intersection of the given
+	// rectangle with the current clipping region, expressed in the
+	// canvas's current user coordinate system. It returns a function
+	// that restores the clipping region (and only the clipping region)
+	// to what it was before the call.
+	Clip(r Rectangle) (restore func())
+}
+
 // CanvasWriterTo is a CanvasSizer with a WriteTo method.
 type CanvasWriterTo interface {
 	CanvasSizer

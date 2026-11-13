@@ -47,8 +47,29 @@ func init() {
 	})
 }
 
-// DPI is the nominal resolution of drawing in PDF.
+// DPI returns the nominal resolution of drawing in PDF.
 const DPI = 72
+
+// Clip restricts drawing to the intersection of the given rectangle
+// with the current clipping region. The rectangle is expressed in the
+// canvas's current user coordinate system. The returned function
+// restores the clipping region that was in place when Clip was called.
+func (c *Canvas) Clip(r vg.Rectangle) (restore func()) {
+	// fpdf places rectangles from the top-left corner of the page,
+	// while vg uses a bottom-left origin. The current transform stack
+	// (which includes the page's y-flip) is active while the clipping
+	// path is installed, so express the rectangle through it.
+	c.Push()
+	defer c.Pop()
+
+	x, y := c.pdfPoint(r.Min)
+	w, h := c.pdfPoint(r.Size())
+	c.doc.ClipRect(x, y, w, h, false)
+
+	return c.doc.ClipEnd
+}
+
+var _ vg.ClipCanvas = (*Canvas)(nil)
 
 // Canvas implements the vg.Canvas interface,
 // drawing to a PDF.

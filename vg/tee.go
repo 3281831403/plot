@@ -126,4 +126,24 @@ func (tee teeCanvas) DrawImage(rect Rectangle, img image.Image) {
 	}
 }
 
+// Clip restricts drawing on every wrapped Canvas that implements
+// ClipCanvas to the given rectangle. Canvases without clipping support
+// keep receiving unclipped operations. The returned function restores
+// the clipping region of every clipped canvas.
+func (tee teeCanvas) Clip(rect Rectangle) (restore func()) {
+	var restores []func()
+	for _, c := range tee.cs {
+		if c, ok := c.(ClipCanvas); ok {
+			restores = append(restores, c.Clip(rect))
+		}
+	}
+	return func() {
+		// Restore in reverse order so nested clips unwind correctly.
+		for i := len(restores) - 1; i >= 0; i-- {
+			restores[i]()
+		}
+	}
+}
+
 var _ Canvas = (*teeCanvas)(nil)
+var _ ClipCanvas = teeCanvas{}

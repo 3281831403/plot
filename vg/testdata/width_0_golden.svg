@@ -47,5 +47,8 @@
 <path d="M34.885,83.093L38.885,83.093" style="fill:none;stroke:#000000;stroke-width:0.5" />
 <path d="M34.885,88.778L38.885,88.778" style="fill:none;stroke:#000000;stroke-width:0.5" />
 <path d="M38.885,37.613L38.885,94.463" style="fill:none;stroke:#000000;stroke-width:0.5" />
+<defs><clipPath id="gonum-clip-0"><rect x="44.635" y="37.613" width="49.115" height="56.85"/></clipPath></defs>
+<g clip-path="url(#gonum-clip-0)">
+</g>
 </g>
 </svg>

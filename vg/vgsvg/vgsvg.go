@@ -68,6 +68,11 @@ type Canvas struct {
 	buf   *bytes.Buffer // buf is the SVG document.
 	stack []context
 
+	// clips is the number of still-active Clip calls.
+	clips int
+	// clipID is a counter used to name clipPath definitions.
+	clipID int
+
 	// Switch to embed fonts in SVG file.
 	// The default is to *not* embed fonts.
 	// Embedding fonts makes the SVG file larger but also more portable.
@@ -204,6 +209,36 @@ func (c *Canvas) Pop() {
 	}
 	c.stack = c.stack[:len(c.stack)-1]
 }
+
+// Clip restricts drawing to the intersection of the given rectangle
+// with the current clipping region. The rectangle is expressed in the
+// canvas's current user coordinate system. The returned function
+// restores the clipping region that was in place when Clip was called.
+func (c *Canvas) Clip(r vg.Rectangle) (restore func()) {
+	c.clips++
+	id := fmt.Sprintf("gonum-clip-%d", c.clipID)
+	c.clipID++
+
+	// The clipPath is defined in the current user coordinate system
+	// (clipPathUnits defaults to userSpaceOnUse), so it follows any
+	// active transform applied to the group that references it.
+	fmt.Fprintf(c.buf,
+		`<defs><clipPath id="%s"><rect x="%.*g" y="%.*g" width="%.*g" height="%.*g"/></clipPath></defs>`+"\n",
+		id,
+		pr, r.Min.X.Points(),
+		pr, r.Min.Y.Points(),
+		pr, r.Size().X.Points(),
+		pr, r.Size().Y.Points(),
+	)
+	fmt.Fprintf(c.buf, `<g clip-path="url(#%s)">`+"\n", id)
+
+	return func() {
+		fmt.Fprintln(c.buf, "</g>")
+		c.clips--
+	}
+}
+
+var _ vg.ClipCanvas = (*Canvas)(nil)
 
 func (c *Canvas) Stroke(path vg.Path) {
 	if c.context().lineWidth.Points() <= 0 {
@@ -538,6 +573,10 @@ func (c *cwriter) Write(p []byte) (int, error) {
 // WriteTo writes the canvas to an io.Writer.
 func (c *Canvas) WriteTo(w io.Writer) (int64, error) {
 	b := &cwriter{w: bufio.NewWriter(w)}
+
+	if c.clips != 0 {
+		return 0, fmt.Errorf("vgsvg: %d clip regions were not restored", c.clips)
+	}
 
 	if c.embed {
 		fmt.Fprintf(c.hdr, "\t</style>\n</defs>\n")

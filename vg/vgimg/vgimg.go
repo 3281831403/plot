@@ -15,9 +15,11 @@ import (
 	"image/jpeg"
 	"image/png"
 	"io"
+	"math"
 
 	"git.sr.ht/~sbinet/gg"
 	"golang.org/x/image/tiff"
+	"golang.org/x/image/vector"
 
 	"gonum.org/v1/plot/font"
 	"gonum.org/v1/plot/vg"
@@ -63,6 +65,64 @@ type Canvas struct {
 	// backgroundColor is the background color, set by
 	// UseBackgroundColor.
 	backgroundColor color.Color
+
+	// matrix mirrors the affine transform applied to the gg context
+	// (including its Y inversion), mapping user-space dots to device
+	// pixels. gg does not expose its matrix, so it is tracked here.
+	matrix      affine
+	matrixStack []affine
+
+	// clips holds the mask in place before each still-active Clip
+	// call; a nil entry means no clip was active at that point.
+	clips      []*image.Alpha
+	activeMask *image.Alpha
+}
+
+// affine is a 2D affine transform:
+//
+//	x' = xx*x + xy*y + x0
+//	y' = yx*x + yy*y + y0
+type affine struct {
+	xx, yx, xy, yy, x0, y0 float64
+}
+
+func identityAffine() affine {
+	return affine{xx: 1, yy: 1}
+}
+
+// transform maps a point through the affine.
+func (a affine) transform(x, y float64) (float64, float64) {
+	return a.xx*x + a.xy*y + a.x0, a.yx*x + a.yy*y + a.y0
+}
+
+// translate post-multiplies a translation, matching gg's semantics.
+func (a affine) translate(tx, ty float64) affine {
+	return affine{
+		xx: a.xx, yx: a.yx,
+		xy: a.xy, yy: a.yy,
+		x0: tx*a.xx + ty*a.xy + a.x0,
+		y0: tx*a.yx + ty*a.yy + a.y0,
+	}
+}
+
+// scale post-multiplies a scaling, matching gg's semantics.
+func (a affine) scale(sx, sy float64) affine {
+	return affine{
+		xx: sx * a.xx, yx: sx * a.yx,
+		xy: sy * a.xy, yy: sy * a.yy,
+		x0: a.x0, y0: a.y0,
+	}
+}
+
+// rotate post-multiplies an anticlockwise rotation, matching gg's
+// semantics.
+func (a affine) rotate(rad float64) affine {
+	c, s := math.Cos(rad), math.Sin(rad)
+	return affine{
+		xx: c*a.xx + s*a.xy, yx: c*a.yx + s*a.yy,
+		xy: -s*a.xx + c*a.xy, yy: -s*a.yx + c*a.yy,
+		x0: a.x0, y0: a.y0,
+	}
 }
 
 const (
@@ -124,6 +184,15 @@ func NewWith(o ...option) *Canvas {
 		c.ctx.SetLineCapButt()
 		c.img = c.ctx.Image().(draw.Image)
 		c.ctx.InvertY()
+		// Mirror the context's InvertY: translate by the image
+		// height then flip the Y axis, in device pixels. A context
+		// supplied through UseImageWithContext is not inverted and
+		// keeps the identity matrix.
+		c.matrix = identityAffine().
+			translate(0, float64(c.img.Bounds().Dy())).
+			scale(1, -1)
+	} else {
+		c.matrix = identityAffine()
 	}
 	draw.Draw(c.img, c.img.Bounds(), &image.Uniform{c.backgroundColor}, image.Point{}, draw.Src)
 	c.color = []color.Color{color.Black}
@@ -237,24 +306,31 @@ func (c *Canvas) SetColor(clr color.Color) {
 
 func (c *Canvas) Rotate(t float64) {
 	c.ctx.Rotate(t)
+	c.matrix = c.matrix.rotate(t)
 }
 
 func (c *Canvas) Translate(pt vg.Point) {
 	c.ctx.Translate(pt.X.Dots(c.DPI()), pt.Y.Dots(c.DPI()))
+	c.matrix = c.matrix.translate(pt.X.Dots(c.DPI()), pt.Y.Dots(c.DPI()))
 }
 
 func (c *Canvas) Scale(x, y float64) {
 	c.ctx.Scale(x, y)
+	c.matrix = c.matrix.scale(x, y)
 }
 
 func (c *Canvas) Push() {
 	c.color = append(c.color, c.color[len(c.color)-1])
 	c.ctx.Push()
+	c.matrixStack = append(c.matrixStack, c.matrix)
 }
 
 func (c *Canvas) Pop() {
 	c.color = c.color[:len(c.color)-1]
 	c.ctx.Pop()
+	n := len(c.matrixStack)
+	c.matrix = c.matrixStack[n-1]
+	c.matrixStack = c.matrixStack[:n-1]
 }
 
 func (c *Canvas) Stroke(p vg.Path) {
@@ -315,6 +391,67 @@ func (c *Canvas) outline(p vg.Path) {
 func (c *Canvas) DPI() float64 {
 	return float64(c.dpi)
 }
+
+// Clip restricts drawing to the intersection of the given rectangle
+// with the current clipping region. The rectangle is expressed in the
+// canvas's current user coordinate system, so any active transform is
+// applied to it. The returned function restores the clipping region
+// that was in place when Clip was called.
+func (c *Canvas) Clip(r vg.Rectangle) (restore func()) {
+	// gg's own Clip rasterizes its mask through the current context
+	// transform, but consults the mask in untransformed device pixels;
+	// with InvertY active that places the clip region on the wrong
+	// side of the image. Rasterize the transformed rectangle into a
+	// device-space mask instead, mapping the corners through the
+	// tracked transform.
+	dpi := c.DPI()
+	pts := [4][2]float64{
+		{r.Min.X.Dots(dpi), r.Min.Y.Dots(dpi)},
+		{r.Max.X.Dots(dpi), r.Min.Y.Dots(dpi)},
+		{r.Max.X.Dots(dpi), r.Max.Y.Dots(dpi)},
+		{r.Min.X.Dots(dpi), r.Max.Y.Dots(dpi)},
+	}
+	var dev [4][2]float64
+	for i, p := range pts {
+		dev[i][0], dev[i][1] = c.matrix.transform(p[0], p[1])
+	}
+
+	b := c.img.Bounds()
+	next := image.NewAlpha(b)
+	rasterizer := vector.NewRasterizer(b.Dx(), b.Dy())
+	rasterizer.MoveTo(float32(dev[0][0]), float32(dev[0][1]))
+	for _, p := range dev[1:] {
+		rasterizer.LineTo(float32(p[0]), float32(p[1]))
+	}
+	rasterizer.ClosePath()
+	rasterizer.Draw(next, image.Rect(0, 0, b.Dx(), b.Dy()), image.NewUniform(color.Alpha{A: 255}), image.Point{})
+
+	// gg keeps its current mask private, so the canvas tracks the
+	// active mask itself. Intersect the new rectangle with whatever
+	// clip region was in place before this call.
+	prev := c.activeMask
+	n := len(c.clips)
+	if prev != nil {
+		inter := image.NewAlpha(b)
+		draw.DrawMask(inter, b, next, image.Point{}, prev, image.Point{}, draw.Over)
+		next = inter
+	}
+	c.clips = append(c.clips, prev)
+	c.activeMask = next
+	_ = c.ctx.SetMask(next)
+
+	return func() {
+		c.clips = c.clips[:n]
+		c.activeMask = prev
+		if prev == nil {
+			c.ctx.ResetClip()
+			return
+		}
+		_ = c.ctx.SetMask(prev)
+	}
+}
+
+var _ vg.ClipCanvas = (*Canvas)(nil)
 
 func (c *Canvas) FillString(font font.Face, pt vg.Point, str string) {
 	if font.Font.Size == 0 {
