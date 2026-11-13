@@ -630,7 +630,16 @@ var UTCUnixTime = UnixTimeIn(time.UTC)
 // TimeTicks is suitable for axes representing time values.
 type TimeTicks struct {
 	// Ticker is used to generate a set of ticks.
-	// If nil, DefaultTicks will be used.
+	// If nil, ticks are placed on calendar boundaries (whole
+	// minutes, hours, local midnights, first of month or first
+	// of January) in the location of the Time function, chosen
+	// according to the span of the axis. Calendar ticks are
+	// computed in local wall-clock time, so they never fall on
+	// times that do not exist (such as during a spring DST
+	// transition) and are not duplicated when a wall-clock time
+	// occurs twice (such as during an autumn DST transition).
+	// If the Time function is not a unix-seconds conversion,
+	// DefaultTicks will be used instead.
 	Ticker Ticker
 
 	// Format is the textual representation of the time value.
@@ -646,14 +655,18 @@ var _ Ticker = TimeTicks{}
 
 // Ticks implements plot.Ticker.
 func (t TimeTicks) Ticks(min, max float64) []Tick {
-	if t.Ticker == nil {
-		t.Ticker = DefaultTicks{}
-	}
 	if t.Format == "" {
 		t.Format = time.RFC3339
 	}
 	if t.Time == nil {
 		t.Time = UTCUnixTime
+	}
+
+	if t.Ticker == nil {
+		if ticks, ok := t.calendarTicks(min, max); ok {
+			return ticks
+		}
+		t.Ticker = DefaultTicks{}
 	}
 
 	ticks := t.Ticker.Ticks(min, max)
@@ -665,6 +678,201 @@ func (t TimeTicks) Ticks(min, max float64) []Tick {
 		tick.Label = t.Time(tick.Value).Format(t.Format)
 	}
 	return ticks
+}
+
+// calendarTicks returns ticks placed on calendar boundaries in the
+// location of the Time function. It reports whether calendar ticks
+// apply: they require a unix-seconds time conversion such as the one
+// returned by UnixTimeIn.
+func (t TimeTicks) calendarTicks(min, max float64) ([]Tick, bool) {
+	if !(min < max) {
+		return nil, false
+	}
+	if t.Time(min).Unix() != int64(min) || t.Time(max).Unix() != int64(max) {
+		// The time conversion is not based on unix seconds,
+		// so calendar boundaries cannot be inverted back to
+		// axis values.
+		return nil, false
+	}
+	loc := t.Time(min).Location()
+
+	vals, ok := calendarTickValues(min, max, loc)
+	if !ok {
+		return nil, false
+	}
+	ticks := make([]Tick, len(vals))
+	for i, v := range vals {
+		ticks[i] = Tick{Value: v, Label: t.Time(v).Format(t.Format)}
+	}
+	return ticks, true
+}
+
+// Units for calendarStep.
+const (
+	calendarSecond = iota
+	calendarMinute
+	calendarHour
+	calendarDay
+	calendarMonth
+	calendarYear
+)
+
+// calendarStep is a step between successive calendar-aligned ticks,
+// expressed in wall-clock (civil) time.
+type calendarStep struct {
+	unit int
+	n    int
+}
+
+// calendarSteps is the ordered list of candidate steps between
+// calendar-aligned ticks, from the shortest to the longest.
+var calendarSteps = []calendarStep{
+	{calendarSecond, 1},
+	{calendarSecond, 2},
+	{calendarSecond, 5},
+	{calendarSecond, 10},
+	{calendarSecond, 15},
+	{calendarSecond, 30},
+	{calendarMinute, 1},
+	{calendarMinute, 2},
+	{calendarMinute, 5},
+	{calendarMinute, 10},
+	{calendarMinute, 15},
+	{calendarMinute, 30},
+	{calendarHour, 1},
+	{calendarHour, 2},
+	{calendarHour, 3},
+	{calendarHour, 6},
+	{calendarHour, 12},
+	{calendarDay, 1},
+	{calendarDay, 2},
+	{calendarDay, 7},
+	{calendarDay, 14},
+	{calendarMonth, 1},
+	{calendarMonth, 3},
+	{calendarMonth, 6},
+	{calendarYear, 1},
+	{calendarYear, 2},
+	{calendarYear, 5},
+	{calendarYear, 10},
+	{calendarYear, 20},
+	{calendarYear, 50},
+	{calendarYear, 100},
+	{calendarYear, 200},
+	{calendarYear, 500},
+	{calendarYear, 1000},
+	{calendarYear, 2000},
+	{calendarYear, 5000},
+}
+
+// suggestedCalendarTicks is the target number of ticks on a time axis.
+const suggestedCalendarTicks = 3
+
+// calendarTickValues returns unix-seconds values of calendar-aligned
+// ticks within [min, max] in the given location. The step between
+// ticks is the longest calendar step that yields at least
+// suggestedCalendarTicks ticks. The returned values are strictly
+// increasing and all lie within [min, max].
+func calendarTickValues(min, max float64, loc *time.Location) ([]float64, bool) {
+	var best calendarStep
+	found := false
+	for _, s := range calendarSteps {
+		// Count the ticks for this step, stopping as soon as
+		// we know there are at least suggestedCalendarTicks+1.
+		if vals := s.values(min, max, loc, suggestedCalendarTicks+1); len(vals) >= suggestedCalendarTicks {
+			best = s
+			found = true
+		}
+	}
+	if !found {
+		// No step yields enough ticks; use the longest step
+		// that yields at least one.
+		for i := len(calendarSteps) - 1; i >= 0; i-- {
+			if vals := calendarSteps[i].values(min, max, loc, 2); len(vals) != 0 {
+				best = calendarSteps[i]
+				found = true
+				break
+			}
+		}
+	}
+	if !found {
+		return nil, false
+	}
+	return best.values(min, max, loc, 0), true
+}
+
+// values returns the unix-seconds values of ticks for s within
+// [min, max] in loc. If cap is positive, at most cap values are
+// returned. Ticks are placed on wall-clock calendar boundaries:
+// wall-clock times that do not exist in loc (such as during a
+// spring DST transition) are skipped, and wall-clock times that
+// occur twice (such as during an autumn DST transition) are
+// reported only once.
+func (s calendarStep) values(min, max float64, loc *time.Location, cap int) []float64 {
+	start := time.Unix(int64(min), 0).In(loc)
+	y, mo, d := start.Date()
+	h, mi, sec := start.Clock()
+
+	// Align the first candidate to the step.
+	switch s.unit {
+	case calendarSecond:
+		sec -= sec % s.n
+	case calendarMinute:
+		sec = 0
+		mi -= mi % s.n
+	case calendarHour:
+		sec, mi = 0, 0
+		h -= h % s.n
+	case calendarDay:
+		sec, mi, h = 0, 0, 0
+		d = 1 + (d-1)/s.n*s.n
+	case calendarMonth:
+		sec, mi, h, d = 0, 0, 0, 1
+		mo = 1 + (mo-1)/time.Month(s.n)*time.Month(s.n)
+	case calendarYear:
+		sec, mi, h, d, mo = 0, 0, 0, 1, 1
+		y -= y % s.n
+	}
+
+	var vals []float64
+	last := int64(math.MinInt64)
+	for {
+		cand := time.Date(y, mo, d, h, mi, sec, 0, loc)
+		if u := cand.Unix(); float64(u) > max {
+			break
+		} else if u > last && float64(u) >= min &&
+			cand.Year() == y && cand.Month() == mo && cand.Day() == d &&
+			cand.Hour() == h && cand.Minute() == mi && cand.Second() == sec {
+			// The wall-clock time exists in loc (it is not
+			// skipped by a DST transition) and is new.
+			vals = append(vals, float64(u))
+			last = u
+			if cap > 0 && len(vals) >= cap {
+				return vals
+			}
+		}
+
+		// Advance to the next candidate in wall-clock time,
+		// normalizing field overflows with civil arithmetic.
+		switch s.unit {
+		case calendarSecond:
+			sec += s.n
+		case calendarMinute:
+			mi += s.n
+		case calendarHour:
+			h += s.n
+		case calendarDay:
+			d += s.n
+		case calendarMonth:
+			mo += time.Month(s.n)
+		case calendarYear:
+			y += s.n
+		}
+		t := time.Date(y, mo, d, h, mi, sec, 0, time.UTC)
+		y, mo, d = t.Date()
+		h, mi, sec = t.Clock()
+	}
+	return vals
 }
 
 // A Tick is a single tick mark on an axis.
