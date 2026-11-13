@@ -7,6 +7,7 @@ package plot
 import (
 	"image/color"
 	"math"
+	"sort"
 	"strconv"
 	"time"
 
@@ -275,9 +276,10 @@ func (a horizontalAxis) draw(c draw.Canvas) {
 	marks := a.Tick.Marker.Ticks(a.Min, a.Max)
 	ticklabelheight := tickLabelHeight(a.Tick.Label, marks)
 	descent := a.Tick.Label.FontExtents().Descent
-	for _, t := range marks {
+	hidden := pruneOverlappingLabels(a.Axis, c, marks)
+	for i, t := range marks {
 		x := c.X(a.Norm(t.Value))
-		if !c.ContainsX(x) || t.IsMinor() {
+		if !c.ContainsX(x) || t.IsMinor() || hidden[i] {
 			continue
 		}
 		c.FillText(a.Tick.Label, vg.Point{X: x, Y: y + ticklabelheight + descent}, t.Label)
@@ -405,9 +407,10 @@ func (a verticalAxis) draw(c draw.Canvas) {
 
 	major := false
 	descent := a.Tick.Label.FontExtents().Descent
-	for _, t := range marks {
+	hidden := pruneOverlappingLabels(a.Axis, c, marks)
+	for i, t := range marks {
 		y := c.Y(a.Norm(t.Value))
-		if !c.ContainsY(y) || t.IsMinor() {
+		if !c.ContainsY(y) || t.IsMinor() || hidden[i] {
 			continue
 		}
 		c.FillText(a.Tick.Label, vg.Point{X: x, Y: y + descent}, t.Label)
@@ -588,21 +591,161 @@ func (t LogTicks) Ticks(min, max float64) []Tick {
 	if min <= 0 || max <= 0 {
 		panic("Values must be greater than 0 for a log scale.")
 	}
+	if max <= min {
+		panic("illegal range")
+	}
 
-	val := math.Pow10(int(math.Log10(min)))
-	max = math.Pow10(int(math.Ceil(math.Log10(max))))
+	// subDecade reports whether the data range stays inside a single
+	// decade and therefore contains no power of ten.
+	subDecade := math.Log10(max)-math.Log10(min) < 1
+
+	// Build the logarithmic grid. Powers of ten carry a label, except in a
+	// sub-decade range where every power of ten lies outside the data range;
+	// labels for those are added further below on in-range positions.
+	//
+	// The starting decade exponent uses int truncation for ranges spanning a
+	// whole decade, matching the historical grid exactly. A sub-decade range
+	// entirely below unity needs math.Floor instead: int truncates negative
+	// logarithms toward zero and would pick the decade above the data minimum
+	// (int(log10(0.2)) == 0 rather than -1), producing no in-range ticks.
+	loExp := int(math.Log10(min))
+	if subDecade {
+		loExp = int(math.Floor(math.Log10(min)))
+	}
+	hiExp := int(math.Ceil(math.Log10(max)))
 	var ticks []Tick
-	for val < max {
+	// Iterate over the decade exponents rather than multiplying a running
+	// value: for very small magnitudes repeated *= 10 accumulates rounding
+	// error and may never reach the stopping power of ten.
+	for exp := loExp; exp < hiExp; exp++ {
+		val := math.Pow10(exp)
 		for i := 1; i < 10; i++ {
 			if i == 1 {
-				ticks = append(ticks, Tick{Value: val, Label: formatFloatTick(val, t.Prec)})
+				tk := Tick{Value: val}
+				if !subDecade {
+					tk.Label = formatFloatTick(val, t.Prec)
+				}
+				ticks = append(ticks, tk)
 			}
 			ticks = append(ticks, Tick{Value: val * float64(i)})
 		}
-		val *= 10
 	}
-	ticks = append(ticks, Tick{Value: val, Label: formatFloatTick(val, t.Prec)})
+	val := math.Pow10(hiExp)
+	ticks = append(ticks, Tick{Value: val})
+	if !subDecade {
+		ticks[len(ticks)-1].Label = formatFloatTick(val, t.Prec)
+	}
 
+	if !subDecade {
+		return ticks
+	}
+
+	// A sub-decade range contains no power of ten, so the grid built above
+	// has no labelled positions inside the data range. Label the exact range
+	// endpoints (clean user-supplied values) and, when available, the
+	// logarithmic grid position nearest to the log-midpoint. The interior
+	// value is snapped back to its nominal decimal form so that rounding in
+	// grid arithmetic (1e-9*7 rather than 7e-9) does not leak into the label.
+	//
+	// The tick marks keep their original density: existing grid positions are
+	// only labelled, and endpoint marks are inserted only where the grid did
+	// not already provide one.
+	const eps = dlamchP * 100
+	inRange := func(v float64) bool {
+		return min-math.Abs(min)*eps <= v && v <= max+math.Abs(max)*eps
+	}
+	mid := math.Sqrt(min * max)
+	var (
+		bestGrid  float64
+		haveGrid  bool
+		bestDelta = math.Inf(1)
+	)
+	for _, tk := range ticks {
+		if !inRange(tk.Value) {
+			continue
+		}
+		if d := math.Abs(math.Log10(tk.Value) - math.Log10(mid)); d < bestDelta {
+			bestDelta = d
+			bestGrid = tk.Value
+			haveGrid = true
+		}
+	}
+
+	// labelled holds the values that must carry a label, mapped to the exact
+	// (possibly decimal-snapped) value used both for matching and rendering.
+	labelled := map[float64]string{
+		min: formatFloatTick(min, t.Prec),
+		max: formatFloatTick(max, t.Prec),
+	}
+	if haveGrid {
+		snapped := snapToDecimalGrid(bestGrid)
+		labelled[snapped] = formatFloatTick(snapped, t.Prec)
+	}
+
+	// Add an endpoint tick mark where no grid position already provides one,
+	// matching within a relative tolerance so a noisy grid value that is
+	// effectively equal to an endpoint is reused rather than duplicated.
+	ensureTick := func(v float64) {
+		for _, tk := range ticks {
+			if math.Abs(tk.Value-v) <= math.Abs(v)*eps {
+				return
+			}
+		}
+		ticks = insertSortedTick(ticks, Tick{Value: v})
+	}
+	for v := range labelled {
+		ensureTick(v)
+	}
+	for i := range ticks {
+		for v, label := range labelled {
+			if math.Abs(ticks[i].Value-v) <= math.Abs(v)*eps {
+				ticks[i].Label = label
+			}
+		}
+	}
+
+	return ticks
+}
+
+// snapToDecimalGrid returns the nearest value of the form m*10^e with integer
+// mantissa m, reconstructed by parsing its shortest decimal representation.
+// Recomputing the value arithmetically (mantissa*math.Pow10(e)) can return a
+// differently-rounded bit pattern than the decimal literal the user wrote, so
+// the reconstruction goes through ParseFloat, which rounds to nearest: this
+// turns 1e-9*7 == 7.000000000000001e-09 back into 7e-09.
+func snapToDecimalGrid(v float64) float64 {
+	if v == 0 {
+		return 0
+	}
+	e := int(math.Floor(math.Log10(v)))
+	mantissa := int(math.Round(v / math.Pow10(e)))
+	switch {
+	case mantissa >= 10:
+		mantissa = 1
+		e++
+	case mantissa < 1:
+		mantissa = 10
+		e--
+	}
+	snapped, err := strconv.ParseFloat(strconv.Itoa(mantissa)+"e"+strconv.Itoa(e), 64)
+	if err != nil {
+		return v
+	}
+	return snapped
+}
+
+// insertSortedTick returns ticks with tk inserted at the first position whose
+// value is greater than tk.Value. An equal value is not inserted again.
+func insertSortedTick(ticks []Tick, tk Tick) []Tick {
+	i := sort.Search(len(ticks), func(i int) bool {
+		return ticks[i].Value >= tk.Value
+	})
+	if i < len(ticks) && ticks[i].Value == tk.Value {
+		return ticks
+	}
+	ticks = append(ticks, Tick{})
+	copy(ticks[i+1:], ticks[i:])
+	ticks[i] = tk
 	return ticks
 }
 
@@ -724,6 +867,123 @@ func tickLabelWidth(sty text.Style, ticks []Tick) vg.Length {
 		}
 	}
 	return maxWidth
+}
+
+// axisIsLogScale reports whether the axis uses a logarithmic coordinate
+// scale, including an inverted logarithmic scale.
+func axisIsLogScale(a Axis) bool {
+	switch s := a.Scale.(type) {
+	case LogScale:
+		return true
+	case InvertedScale:
+		if _, ok := s.Normalizer.(LogScale); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// pruneOverlappingLabels returns, for each tick, whether its label must be
+// hidden to avoid overlapping a neighbouring label. Tick marks are never
+// hidden: only labels are removed, so the density of the ticks is preserved.
+//
+// Labels at the ends of the axis are kept where possible, and the remaining
+// labels are removed from the middle outwards, so every visible label has a
+// collision-free slot. Minor ticks are never reported as hidden.
+func pruneOverlappingLabels(a Axis, c draw.Canvas, ticks []Tick) []bool {
+	hidden := make([]bool, len(ticks))
+	if len(ticks) == 0 {
+		return hidden
+	}
+
+	// Label overlap resolution only applies to logarithmic axes; the tick
+	// labelling of linear axes is chosen by the ticker and must be kept
+	// unchanged.
+	if !axisIsLogScale(a) {
+		return hidden
+	}
+
+	horizontal := a.Tick.Label.YAlign == draw.YTop
+
+	// position reports the position of a tick along the axis in canvas
+	// coordinates and whether the tick lies inside the canvas.
+	position := func(t Tick) (vg.Length, bool) {
+		if horizontal {
+			p := c.X(a.Norm(t.Value))
+			return p, c.ContainsX(p)
+		}
+		p := c.Y(a.Norm(t.Value))
+		return p, c.ContainsY(p)
+	}
+	// extent reports the size of a label along the axis.
+	extent := func(label string) vg.Length {
+		if horizontal {
+			return a.Tick.Label.Width(label)
+		}
+		return a.Tick.Label.Height(label)
+	}
+	// gap is the minimum blank space required between two adjacent labels.
+	var gap vg.Length
+	if horizontal {
+		gap = a.Tick.Label.Width(" ")
+	} else {
+		gap = a.Tick.Label.Height(" ")
+	}
+
+	type slot struct {
+		idx    int
+		pos    vg.Length
+		extent vg.Length
+	}
+	var slots []slot
+	for i, t := range ticks {
+		if t.IsMinor() {
+			continue
+		}
+		pos, ok := position(t)
+		if !ok {
+			// Labels outside the canvas are skipped by the draw loop,
+			// so they must not participate in collision resolution.
+			hidden[i] = true
+			continue
+		}
+		slots = append(slots, slot{idx: i, pos: pos, extent: extent(t.Label)})
+	}
+	if len(slots) <= 1 {
+		return hidden
+	}
+
+	// Select a maximal set of non-overlapping labels with a greedy scan.
+	// Labels are centred on their tick position, so a label occupies
+	// [pos-extent/2, pos+extent/2], and a blank gap is required between two
+	// consecutive kept labels. A label is kept only when its box starts at or
+	// after the end of the most recently kept label's box (plus gap).
+	// Rejected labels do not advance the boundary, otherwise a single
+	// rejected label could suppress every label that follows it.
+	//
+	// Ticks are generated in ascending data order, which is descending in
+	// canvas position on a vertical axis, so the slots are sorted first.
+	sort.Slice(slots, func(i, j int) bool {
+		return slots[i].pos < slots[j].pos
+	})
+	keep := make([]bool, len(slots))
+	keep[0] = true
+	// blockedUntil is the earliest position at which a subsequent label's box
+	// may start, derived from the most recently kept label.
+	blockedUntil := slots[0].pos + slots[0].extent/2 + gap
+	for i := 1; i < len(slots); i++ {
+		if start := slots[i].pos - slots[i].extent/2; start >= blockedUntil {
+			keep[i] = true
+			blockedUntil = slots[i].pos + slots[i].extent/2 + gap
+		}
+	}
+
+	for i, s := range slots {
+		if !keep[i] {
+			hidden[s.idx] = true
+		}
+	}
+	return hidden
 }
 
 // formatFloatTick returns a g-formated string representation of v
