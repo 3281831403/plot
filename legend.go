@@ -5,8 +5,6 @@
 package plot
 
 import (
-	"math"
-
 	"gonum.org/v1/plot/font"
 	"gonum.org/v1/plot/text"
 	"gonum.org/v1/plot/vg"
@@ -17,6 +15,14 @@ import (
 // data elements of the plot.  Each legend entry has a name
 // and a thumbnail, where the thumbnail shows a small
 // sample of the display style of the corresponding data.
+//
+// The legend entries are laid out in a single column as long
+// as they fit within the vertical extent of the canvas they
+// are drawn on.  When more entries are present than fit in a
+// single column, the entries are wrapped into as many columns
+// as needed for the whole legend to remain inside the canvas.
+// Entries fill each column from top to bottom, in the order
+// they were added, before moving on to the next column.
 type Legend struct {
 	// TextStyle is the style given to the legend
 	// entry texts.
@@ -94,33 +100,12 @@ func newLegend(hdlr text.Handler) Legend {
 
 // Draw draws the legend to the given draw.Canvas.
 func (l *Legend) Draw(c draw.Canvas) {
-	iconx := c.Min.X
 	sty := l.TextStyle
 	em := sty.Rectangle(" ")
-	textx := iconx + l.ThumbnailWidth + em.Max.X
-	if !l.Left {
-		iconx = c.Max.X - l.ThumbnailWidth
-		textx = iconx - em.Max.X
-		sty.XAlign--
-	}
-	textx += l.XOffs
-	iconx += l.XOffs
+	enth := l.entryHeight()
+	rows, cols, widths := l.layout(c)
 
 	descent := sty.FontExtents().Descent
-	enth := l.entryHeight()
-	y := c.Max.Y - enth - descent
-	if !l.Top {
-		y = c.Min.Y + (enth+l.Padding)*(vg.Length(len(l.entries))-1)
-	}
-	y += l.YOffs
-
-	icon := &draw.Canvas{
-		Canvas: c.Canvas,
-		Rectangle: vg.Rectangle{
-			Min: vg.Point{X: iconx, Y: y},
-			Max: vg.Point{X: iconx + l.ThumbnailWidth, Y: y + enth},
-		},
-	}
 
 	if l.YPosition < draw.PosBottom || draw.PosTop < l.YPosition {
 		panic("plot: invalid vertical offset for the legend's entries")
@@ -128,29 +113,73 @@ func (l *Legend) Draw(c draw.Canvas) {
 	yoff := vg.Length(l.YPosition-draw.PosBottom) / 2
 	yoff += descent
 
-	for _, e := range l.entries {
-		for _, t := range e.thumbs {
-			t.Thumbnail(icon)
+	if !l.Left {
+		sty.XAlign--
+	}
+
+	// xoffs[j] is the horizontal offset of the j-th column of
+	// entries from the edge of the canvas the legend is drawn
+	// along.  Columns grow towards the inside of the canvas,
+	// keeping the first entries where a single-column legend
+	// would put them.
+	xoffs := make([]vg.Length, cols)
+	for j := 1; j < cols; j++ {
+		xoffs[j] = xoffs[j-1] + widths[j-1] + l.columnGap()
+	}
+
+	// y is the y-coordinate of the bottom of the icon of the
+	// first entry of each column.
+	y := c.Max.Y - enth - descent
+	if !l.Top {
+		y = c.Min.Y + (enth+l.Padding)*vg.Length(rows-1)
+	}
+	y += l.YOffs
+
+	icon := &draw.Canvas{Canvas: c.Canvas}
+	for j := 0; j < cols; j++ {
+		iconx := c.Min.X + xoffs[j]
+		textx := iconx + l.ThumbnailWidth + em.Max.X
+		if !l.Left {
+			iconx = c.Max.X - l.ThumbnailWidth - xoffs[j]
+			textx = iconx - em.Max.X
 		}
-		yoffs := (enth - descent - sty.Rectangle(e.text).Max.Y) / 2
-		yoffs += yoff
-		c.FillText(sty, vg.Point{X: textx, Y: icon.Min.Y + yoffs}, e.text)
-		icon.Min.Y -= enth + l.Padding
-		icon.Max.Y -= enth + l.Padding
+		textx += l.XOffs
+		iconx += l.XOffs
+
+		icon.Rectangle = vg.Rectangle{
+			Min: vg.Point{X: iconx, Y: y},
+			Max: vg.Point{X: iconx + l.ThumbnailWidth, Y: y + enth},
+		}
+
+		end := (j + 1) * rows
+		if end > len(l.entries) {
+			end = len(l.entries)
+		}
+		for _, e := range l.entries[j*rows : end] {
+			for _, t := range e.thumbs {
+				t.Thumbnail(icon)
+			}
+			yoffs := (enth - descent - sty.Rectangle(e.text).Max.Y) / 2
+			yoffs += yoff
+			c.FillText(sty, vg.Point{X: textx, Y: icon.Min.Y + yoffs}, e.text)
+			icon.Min.Y -= enth + l.Padding
+			icon.Max.Y -= enth + l.Padding
+		}
 	}
 }
 
 // Rectangle returns the extent of the Legend.
 func (l *Legend) Rectangle(c draw.Canvas) vg.Rectangle {
+	rows, cols, widths := l.layout(c)
 	var width, height vg.Length
-	sty := l.TextStyle
-	entryHeight := l.entryHeight()
-	for i, e := range l.entries {
-		width = vg.Length(math.Max(float64(width), float64(l.ThumbnailWidth+sty.Rectangle(" "+e.text).Max.X)))
-		height += entryHeight
-		if i != 0 {
-			height += l.Padding
-		}
+	for _, w := range widths {
+		width += w
+	}
+	if cols > 1 {
+		width += vg.Length(cols-1) * l.columnGap()
+	}
+	if rows > 0 {
+		height = vg.Length(rows)*l.entryHeight() + vg.Length(rows-1)*l.Padding
 	}
 	var r vg.Rectangle
 	if l.Left {
@@ -168,6 +197,49 @@ func (l *Legend) Rectangle(c draw.Canvas) vg.Rectangle {
 		r.Min.Y = c.Min.Y
 	}
 	return r
+}
+
+// layout returns the number of rows and columns used to lay out the
+// legend's entries on the given canvas, and the width of each column.
+// Entries are laid out column-wise, in the order they were added to
+// the legend: the first rows entries fill the first column, the next
+// rows entries the second column, and so on.  A single column is used
+// whenever all the entries fit within the vertical extent of the
+// canvas.
+func (l *Legend) layout(c draw.Canvas) (rows, cols int, widths []vg.Length) {
+	n := len(l.entries)
+	if n == 0 {
+		return 0, 0, nil
+	}
+	enth := l.entryHeight()
+	// maxRows is the maximum number of entries that fit in a
+	// single column within the vertical extent of the canvas.
+	maxRows := int((c.Max.Y - c.Min.Y + l.Padding) / (enth + l.Padding))
+	if maxRows < 1 {
+		maxRows = 1
+	}
+	rows = n
+	if rows > maxRows {
+		rows = maxRows
+	}
+	cols = (n + rows - 1) / rows
+	rows = (n + cols - 1) / cols
+
+	sty := l.TextStyle
+	widths = make([]vg.Length, cols)
+	for i, e := range l.entries {
+		w := l.ThumbnailWidth + sty.Rectangle(" "+e.text).Max.X
+		if j := i / rows; w > widths[j] {
+			widths[j] = w
+		}
+	}
+	return rows, cols, widths
+}
+
+// columnGap returns the horizontal space inserted between two
+// adjacent columns of legend entries.
+func (l *Legend) columnGap() vg.Length {
+	return l.TextStyle.Rectangle(" ").Max.X + l.Padding
 }
 
 // entryHeight returns the height of the tallest legend
